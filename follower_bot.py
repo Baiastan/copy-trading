@@ -359,8 +359,7 @@ def main():
         return
 
     log.info(f"Polling Firebase every {POLL_INTERVAL}s. Press Ctrl+C to stop.")
-    if DRY_RUN:
-        log.info("DRY RUN is ON — no real orders will be placed.")
+    log.info("DRY RUN starts ON — toggle it off in the dashboard to go live.")
     print()
 
     while True:
@@ -370,6 +369,7 @@ def main():
             from firebase_admin import db as fdb
             live       = fdb.reference('copy_trading/status').get() or {}
             copy_on    = live.get('copy_enabled', True)
+            DRY_RUN    = live.get('dry_run', True)   # controlled by dashboard
             size_mult  = float(live.get('size_multiplier', SIZE_MULTIPLIER))
             spread_buf = float(live.get('spread_buffer', 0.05))
             max_age    = int(live.get('max_signal_age', SIGNAL_MAX_AGE_SECONDS))

@@ -101,6 +101,21 @@ with left:
         firebase_db.reference('copy_trading/status/copy_enabled').set(new_enabled)
         st.rerun()
 
+    # Dry run toggle
+    current_dry = bool(status.get('dry_run', True))
+    new_dry = st.toggle(
+        "Dry Run (no real orders)",
+        value=current_dry,
+        key='dry_run_toggle',
+        help="ON = safe mode, just logs. OFF = places real orders on your Webull account."
+    )
+    if new_dry != current_dry:
+        firebase_db.reference('copy_trading/status/dry_run').set(new_dry)
+        st.rerun()
+
+    if not new_dry:
+        st.warning("⚠️ LIVE MODE — real orders will be placed!")
+
     st.divider()
 
     # Size multiplier
