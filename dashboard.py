@@ -152,7 +152,7 @@ with left:
     st.divider()
 
     # Max signal age
-    current_age = int(status.get('max_signal_age', 60))
+    current_age = int(status.get('max_signal_age', 5))
     new_age = st.number_input(
         "Max Signal Age (seconds)",
         min_value=5,
