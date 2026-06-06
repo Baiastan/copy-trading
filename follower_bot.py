@@ -6,33 +6,30 @@ Reads trade signals from Firebase and copies them to your Webull account.
 DRY_RUN = True  → just logs what it would do, NO real orders placed (safe for testing)
 DRY_RUN = False → places real orders on your Webull account
 
+Signal types handled:
+  OPEN         → market BUY to open position
+  CLOSE        → market SELL to close position + cancel any open stop/TP orders
+  PLACE_ORDER  → place a limit/stop order (stop loss or take profit)
+  CANCEL_ORDER → cancel a previously placed stop/TP order
+
 HOW TO RUN:
   python follower_bot.py
-
-REQUIRES:
-  - step1_auth.py must have been run on this machine (token in conf/token.txt)
-  - firebase_credentials.json in this folder
-  - pip install firebase-admin webull-openapi-python-sdk
 """
 
 import time
+import uuid
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from webull.core.client import ApiClient
 from webull.trade.trade_client import TradeClient
-from config import (APP_KEY, APP_SECRET, ACCOUNT_IDS, DEFAULT_ACCOUNT_ID,
+from config import (APP_KEY, APP_SECRET, DEFAULT_ACCOUNT_ID,
                     FIREBASE_DATABASE_URL, FIREBASE_CREDENTIALS_PATH,
                     SIZE_MULTIPLIER, POLL_INTERVAL, SIGNAL_MAX_AGE_SECONDS)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DRY_RUN = True   # Set to False to place real orders
-
 FIREBASE_CREDENTIALS = FIREBASE_CREDENTIALS_PATH
-
-SIZE_MULTIPLIER = 1.0     # copy same size as leader; set 0.5 to copy half
-MAX_SIGNAL_AGE_SECONDS = 60   # ignore signals older than this many seconds
-POLL_INTERVAL = 5         # seconds between Firebase checks
 # ────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -42,28 +39,32 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Maps leader's client_order_id → follower's client_order_id
+# Used to cancel the right order when leader cancels theirs
+order_map: dict[str, str] = {}
 
-# ── Firebase ─────────────────────────────────────────────────────────────────
+# Maps ticker symbol → list of follower client_order_ids (for cancel-on-close)
+symbol_orders: dict[str, list[str]] = {}
+
+
+# ── Firebase ──────────────────────────────────────────────────────────────────
 
 def init_firebase():
     import firebase_admin
-    from firebase_admin import credentials, db as fdb
+    from firebase_admin import credentials
     if not firebase_admin._apps:
         cred = credentials.Certificate(FIREBASE_CREDENTIALS)
         firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DATABASE_URL})
     log.info("Firebase connected.")
 
 
-def get_pending_signals(max_age_seconds: int = MAX_SIGNAL_AGE_SECONDS) -> list:
+def get_pending_signals(max_age_seconds: int) -> list:
     from firebase_admin import db as fdb
-    ref = fdb.reference('copy_trading/signals')
-    data = ref.get() or {}
+    data = fdb.reference('copy_trading/signals').get() or {}
     pending = []
     now = datetime.now(timezone.utc)
     for key, val in data.items():
-        if not isinstance(val, dict):
-            continue
-        if val.get('processed', False):
+        if not isinstance(val, dict) or val.get('processed', False):
             continue
         if val.get('_test', False):
             fdb.reference(f'copy_trading/signals/{key}/processed').set(True)
@@ -71,10 +72,9 @@ def get_pending_signals(max_age_seconds: int = MAX_SIGNAL_AGE_SECONDS) -> list:
         ts = val.get('timestamp', '')
         if ts:
             try:
-                sig_time = datetime.fromisoformat(ts)
-                age = (now - sig_time).total_seconds()
+                age = (now - datetime.fromisoformat(ts)).total_seconds()
                 if age > max_age_seconds:
-                    log.warning(f"Signal {key} is {age:.0f}s old — skipping (too stale)")
+                    log.warning(f"Signal {key} is {age:.0f}s old — skipping")
                     fdb.reference(f'copy_trading/signals/{key}/processed').set(True)
                     fdb.reference(f'copy_trading/signals/{key}/follower_status').set('skipped: stale')
                     continue
@@ -102,75 +102,221 @@ def update_follower_heartbeat():
         pass
 
 
-# ── Order placement ───────────────────────────────────────────────────────────
+# ── Order helpers ─────────────────────────────────────────────────────────────
 
-def execute_signal(trade_client: TradeClient, signal: dict,
-                   size_mult: float = SIZE_MULTIPLIER, spread_buf: float = 0.05):
-    """Execute a copy-trade signal. In DRY_RUN mode, just logs the action."""
-    key = signal.get('_key', 'unknown')
-    event_type = signal.get('event_type', '')
-    ticker = signal.get('ticker', '')
-    action = signal.get('action', '')
-    is_option = signal.get('is_option', False)
-    qty = int(signal.get('qty', 1))
-    price = float(signal.get('price', 0))
+def new_order_id() -> str:
+    return str(uuid.uuid4()).replace('-', '')[:32]
+
+
+def build_option_order(signal: dict, follower_order_id: str,
+                       qty: int, size_mult: float, spread_buf: float) -> dict:
+    """Build the new_orders list payload for order_v2.place_option()."""
+    order_type  = signal.get('order_type', 'LIMIT')
+    side        = signal.get('side', 'BUY')
+    symbol      = signal.get('symbol') or signal.get('ticker', '')
+    option_type = signal.get('option_type', '')
+    strike      = signal.get('strike_price') or signal.get('strike', '')
+    expiry      = signal.get('option_expire_date') or signal.get('expiry', '')
+    tif         = signal.get('time_in_force', 'DAY')
 
     adjusted_qty = max(1, round(qty * size_mult))
-    # Apply spread buffer: pay a little more on buys, accept a little less on sells
-    adjusted_price = price + spread_buf if action == 'BUY' else price - spread_buf
 
-    if is_option:
-        strike = signal.get('strike', 0)
-        expiry = signal.get('expiry', '')
-        option_type = signal.get('option_type', '')
-        desc = f"{ticker} {option_type} ${strike} exp {expiry}"
-    else:
-        desc = ticker
+    order = {
+        'client_order_id':  follower_order_id,
+        'combo_type':       'NORMAL',
+        'order_type':       order_type,
+        'quantity':         str(adjusted_qty),
+        'option_strategy':  'SINGLE',
+        'side':             side,
+        'time_in_force':    tif,
+        'entrust_type':     'QTY',
+        'instrument_type':  'OPTION',
+        'market':           'US',
+        'symbol':           symbol,
+        'legs': [{
+            'side':               side,
+            'quantity':           str(adjusted_qty),
+            'symbol':             symbol,
+            'strike_price':       str(strike),
+            'option_expire_date': str(expiry),
+            'instrument_type':    'OPTION',
+            'option_type':        option_type,
+            'market':             'US',
+        }],
+    }
 
-    log.info(f"--- Signal received: {event_type} {action} {adjusted_qty}x {desc} @ ~${adjusted_price:.2f} (buf +${spread_buf}) ---")
+    # Apply prices with spread buffer
+    limit_price = signal.get('limit_price')
+    stop_price  = signal.get('stop_price')
+
+    if limit_price is not None:
+        buf = spread_buf if side == 'BUY' else -spread_buf
+        order['limit_price'] = str(round(float(limit_price) + buf, 2))
+    if stop_price is not None:
+        order['stop_price'] = str(stop_price)
+
+    return order
+
+
+# ── Signal handlers ───────────────────────────────────────────────────────────
+
+def handle_open(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+    """Open a new position — market BUY."""
+    key    = signal['_key']
+    symbol = signal.get('ticker', '')
+    qty    = max(1, round(int(signal.get('qty', 1)) * size_mult))
+    price  = float(signal.get('price', 0))
+    adj_price = round(price + spread_buf, 2)
+
+    log.info(f"OPEN  {symbol}  qty={qty}  ref_price=${adj_price}")
 
     if DRY_RUN:
-        log.info(f"[DRY RUN] Would place order: {action} {adjusted_qty} {desc} @ ${adjusted_price:.2f}")
-        log.info(f"[DRY RUN] Account: {DEFAULT_ACCOUNT_ID}")
+        log.info(f"[DRY RUN] BUY {qty} {symbol} @ ~${adj_price}")
         mark_processed(key, 'ok (dry run)')
         return
 
-    # Real order placement
     try:
-        import uuid
-        client_order_id = str(uuid.uuid4()).replace('-', '')[:32]
-
-        if not is_option:
-            # Stock order
-            from webull.trade.common.order_side import OrderSide
-            from webull.trade.common.order_type import OrderType
-            from webull.trade.common.time_in_force import TimeInForce
-
-            side = OrderSide.BUY if action == 'BUY' else OrderSide.SELL
-
-            # Get current price for limit order
-            # Using a market order as fallback
-            res = trade_client.order.place_order(
-                account_id=DEFAULT_ACCOUNT_ID,
-                qty=adjusted_qty,
-                instrument_id=signal.get('instrument_id', ''),
-                side=side,
-                client_order_id=client_order_id,
-                order_type=OrderType.MARKET,
-                extended_hours_trading=False,
-                tif=TimeInForce.DAY,
-            )
-            log.info(f"Stock order placed: {res.json()}")
-            mark_processed(key, 'ok')
-        else:
-            # Options — log a warning since US options API is limited
-            log.warning("Options order placement via API is limited for US accounts.")
-            log.warning(f"Manually place: {action} {adjusted_qty}x {desc}")
-            mark_processed(key, 'manual: options not auto-traded')
-
+        follower_oid = new_order_id()
+        new_orders = [build_option_order(
+            {**signal, 'order_type': 'LIMIT', 'side': 'BUY',
+             'limit_price': adj_price, 'time_in_force': 'DAY'},
+            follower_oid, qty, 1.0, 0.0  # qty/spread already applied above
+        )]
+        res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
+        log.info(f"OPEN order placed: {res.json()}")
+        mark_processed(key, 'ok')
     except Exception as e:
-        log.error(f"Order placement failed: {e}")
+        log.error(f"OPEN order failed: {e}")
         mark_processed(key, f'error: {e}')
+
+
+def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+    """Close a position — cancel all open stop/TP orders first, then market SELL."""
+    key    = signal['_key']
+    symbol = signal.get('ticker', '')
+    qty    = max(1, round(int(signal.get('qty', 1)) * size_mult))
+    price  = float(signal.get('price', 0))
+    adj_price = round(price - spread_buf, 2)
+
+    log.info(f"CLOSE {symbol}  qty={qty}  ref_price=${adj_price}")
+
+    # Cancel any outstanding stop/TP orders for this symbol
+    to_cancel = symbol_orders.pop(symbol, [])
+    for foid in to_cancel:
+        if DRY_RUN:
+            log.info(f"[DRY RUN] Would cancel order {foid} for {symbol}")
+        else:
+            try:
+                trade_client.order_v2.cancel_option(DEFAULT_ACCOUNT_ID, foid)
+                log.info(f"Cancelled order {foid}")
+            except Exception as e:
+                log.warning(f"Cancel order {foid} failed (may have already filled): {e}")
+
+    if DRY_RUN:
+        log.info(f"[DRY RUN] SELL {qty} {symbol} @ ~${adj_price}")
+        mark_processed(key, 'ok (dry run)')
+        return
+
+    try:
+        follower_oid = new_order_id()
+        new_orders = [build_option_order(
+            {**signal, 'order_type': 'LIMIT', 'side': 'SELL',
+             'limit_price': adj_price, 'time_in_force': 'DAY'},
+            follower_oid, qty, 1.0, 0.0
+        )]
+        res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
+        log.info(f"CLOSE order placed: {res.json()}")
+        mark_processed(key, 'ok')
+    except Exception as e:
+        log.error(f"CLOSE order failed: {e}")
+        mark_processed(key, f'error: {e}')
+
+
+def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+    """Mirror a stop loss or take profit order from the leader."""
+    key              = signal['_key']
+    leader_oid       = signal.get('leader_client_order_id', '')
+    order_type       = signal.get('order_type', '')
+    side             = signal.get('side', '')
+    symbol           = signal.get('symbol', '')
+    qty              = int(signal.get('qty', 1))
+    limit_price      = signal.get('limit_price')
+    stop_price       = signal.get('stop_price')
+
+    desc = f"{order_type} {side} {symbol}"
+    if limit_price:
+        desc += f" limit=${limit_price}"
+    if stop_price:
+        desc += f" stop=${stop_price}"
+
+    log.info(f"PLACE_ORDER  {desc}  qty={qty}")
+
+    if DRY_RUN:
+        log.info(f"[DRY RUN] Would place: {desc}")
+        mark_processed(key, 'ok (dry run)')
+        return
+
+    try:
+        follower_oid = new_order_id()
+        new_orders = [build_option_order(signal, follower_oid, qty, size_mult, spread_buf)]
+        res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
+        log.info(f"Limit/stop order placed: {res.json()}")
+
+        # Track mapping for future cancellation
+        order_map[leader_oid] = follower_oid
+        symbol_orders.setdefault(symbol, []).append(follower_oid)
+
+        mark_processed(key, 'ok')
+    except Exception as e:
+        log.error(f"PLACE_ORDER failed: {e}")
+        mark_processed(key, f'error: {e}')
+
+
+def handle_cancel_order(trade_client: TradeClient, signal: dict):
+    """Cancel the follower's matching order when leader cancels theirs."""
+    key        = signal['_key']
+    leader_oid = signal.get('leader_client_order_id', '')
+    follower_oid = order_map.pop(leader_oid, None)
+
+    if not follower_oid:
+        log.warning(f"CANCEL_ORDER: no matching follower order for leader={leader_oid}")
+        mark_processed(key, 'skipped: no matching order')
+        return
+
+    log.info(f"CANCEL_ORDER  leader={leader_oid}  follower={follower_oid}")
+
+    # Remove from symbol_orders too
+    for orders in symbol_orders.values():
+        if follower_oid in orders:
+            orders.remove(follower_oid)
+
+    if DRY_RUN:
+        log.info(f"[DRY RUN] Would cancel {follower_oid}")
+        mark_processed(key, 'ok (dry run)')
+        return
+
+    try:
+        trade_client.order_v2.cancel_option(DEFAULT_ACCOUNT_ID, follower_oid)
+        log.info(f"Order {follower_oid} cancelled.")
+        mark_processed(key, 'ok')
+    except Exception as e:
+        log.error(f"Cancel failed (may have already filled): {e}")
+        mark_processed(key, f'error: {e}')
+
+
+def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+    event_type = signal.get('event_type', '')
+    if event_type == 'OPEN':
+        handle_open(trade_client, signal, size_mult, spread_buf)
+    elif event_type == 'CLOSE':
+        handle_close(trade_client, signal, size_mult, spread_buf)
+    elif event_type == 'PLACE_ORDER':
+        handle_place_order(trade_client, signal, size_mult, spread_buf)
+    elif event_type == 'CANCEL_ORDER':
+        handle_cancel_order(trade_client, signal)
+    else:
+        log.warning(f"Unknown event_type: {event_type}")
+        mark_processed(signal['_key'], f'skipped: unknown event_type {event_type}')
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -181,11 +327,10 @@ def main():
     print("=" * 55)
     print()
 
-    if 'YOUR-PROJECT' in FIREBASE_DATABASE_URL:
-        print("ERROR: Set FIREBASE_DATABASE_URL at the top of this file.")
+    if not FIREBASE_DATABASE_URL:
+        print("ERROR: Set FIREBASE_DATABASE_URL in your .env file.")
         return
 
-    # Connect Webull
     log.info("Connecting to Webull...")
     api_client = ApiClient(APP_KEY, APP_SECRET, 'us')
     api_client.add_endpoint('us', 'api.webull.com')
@@ -194,7 +339,6 @@ def main():
     try:
         res = trade_client.account_v2.get_account_list()
         data = res.json()
-        # API returns a plain list or a dict with 'data' key
         accounts = data if isinstance(data, list) else data.get('data', [])
         if not accounts:
             print("ERROR: No accounts found. Run step1_auth.py first.")
@@ -208,12 +352,10 @@ def main():
         print(f"ERROR connecting to Webull: {e}")
         return
 
-    # Connect Firebase
     try:
         init_firebase()
     except Exception as e:
         print(f"ERROR connecting to Firebase: {e}")
-        print("Run python test_firebase.py first to diagnose.")
         return
 
     log.info(f"Polling Firebase every {POLL_INTERVAL}s. Press Ctrl+C to stop.")
@@ -225,27 +367,23 @@ def main():
         try:
             update_follower_heartbeat()
 
-            # Read live settings from Firebase (dashboard controls these)
             from firebase_admin import db as fdb
-            live = fdb.reference('copy_trading/status').get() or {}
-            copy_enabled = live.get('copy_enabled', True)
-            size_mult = float(live.get('size_multiplier', SIZE_MULTIPLIER))
+            live       = fdb.reference('copy_trading/status').get() or {}
+            copy_on    = live.get('copy_enabled', True)
+            size_mult  = float(live.get('size_multiplier', SIZE_MULTIPLIER))
             spread_buf = float(live.get('spread_buffer', 0.05))
-            max_age = int(live.get('max_signal_age', MAX_SIGNAL_AGE_SECONDS))
+            max_age    = int(live.get('max_signal_age', SIGNAL_MAX_AGE_SECONDS))
 
-            if not copy_enabled:
+            if not copy_on:
                 log.info("Copy trading DISABLED via dashboard — skipping.")
                 time.sleep(POLL_INTERVAL)
                 continue
 
             pending = get_pending_signals(max_age_seconds=max_age)
-
             if pending:
-                log.info(f"{len(pending)} pending signal(s) found.")
+                log.info(f"{len(pending)} pending signal(s).")
                 for signal in pending:
                     execute_signal(trade_client, signal, size_mult, spread_buf)
-            else:
-                log.debug("No pending signals.")
 
         except KeyboardInterrupt:
             log.info("Stopped by user.")
