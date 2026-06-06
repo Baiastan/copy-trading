@@ -158,13 +158,48 @@ def build_option_order(signal: dict, follower_order_id: str,
     return order
 
 
+# ── Price / slippage helpers ──────────────────────────────────────────────────
+
+def get_current_ask(trade_client: TradeClient, instrument_id: str) -> float | None:
+    """Fetch live ask (or last) price for an option contract by instrument_id."""
+    if not instrument_id:
+        return None
+    try:
+        res = trade_client.trade_instrument.get_trade_instrument_detail(instrument_id)
+        data = res.json()
+        price = (data.get('askPrice') or data.get('ask') or
+                 data.get('lastPrice') or data.get('last_price') or
+                 data.get('close'))
+        if price is not None:
+            return float(str(price))
+    except Exception as e:
+        log.debug(f"Could not fetch live price for {instrument_id}: {e}")
+    return None
+
+
 # ── Signal handlers ───────────────────────────────────────────────────────────
 
-def handle_open(trade_client: TradeClient, signal: dict, size_mult: float, dry_run: bool):
-    """Open a new position — MARKET BUY (safe on 0DTE with tight spreads)."""
-    key    = signal['_key']
-    symbol = signal.get('ticker', '') or signal.get('symbol', '')
-    qty    = max(1, round(int(signal.get('qty', 1)) * size_mult))
+def handle_open(trade_client: TradeClient, signal: dict, size_mult: float,
+                max_slippage_pct: float, dry_run: bool):
+    """Open a new position — MARKET BUY with slippage guard."""
+    key           = signal['_key']
+    symbol        = signal.get('ticker', '') or signal.get('symbol', '')
+    qty           = max(1, round(int(signal.get('qty', 1)) * size_mult))
+    ref_price     = float(signal.get('price', 0))
+    instrument_id = signal.get('instrument_id', '')
+
+    # ── Slippage check ────────────────────────────────────────────────────────
+    if ref_price > 0 and instrument_id:
+        live_price = get_current_ask(trade_client, instrument_id)
+        if live_price is not None:
+            slippage = abs(live_price - ref_price) / ref_price * 100
+            log.info(f"Slippage check: ref=${ref_price:.2f}  live=${live_price:.2f}  slippage={slippage:.1f}%  max={max_slippage_pct}%")
+            if slippage > max_slippage_pct:
+                log.warning(f"OPEN {symbol} SKIPPED — slippage {slippage:.1f}% > {max_slippage_pct}%")
+                mark_processed(key, f'skipped: slippage {slippage:.1f}%')
+                return
+        else:
+            log.debug("Could not fetch live price — proceeding without slippage check")
 
     log.info(f"OPEN  {symbol}  qty={qty}  MARKET")
 
@@ -298,10 +333,11 @@ def handle_cancel_order(trade_client: TradeClient, signal: dict, dry_run: bool):
         mark_processed(key, f'error: {e}')
 
 
-def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float, dry_run: bool):
+def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float,
+                   dry_run: bool, max_slippage_pct: float = 20.0):
     event_type = signal.get('event_type', '')
     if event_type == 'OPEN':
-        handle_open(trade_client, signal, size_mult, dry_run)
+        handle_open(trade_client, signal, size_mult, max_slippage_pct, dry_run)
     elif event_type == 'CLOSE':
         handle_close(trade_client, signal, size_mult, dry_run)
     elif event_type == 'PLACE_ORDER':
@@ -362,11 +398,12 @@ def main():
 
             from firebase_admin import db as fdb
             live       = fdb.reference('copy_trading/status').get() or {}
-            copy_on    = live.get('copy_enabled', True)
-            dry_run    = live.get('dry_run', True)   # controlled by dashboard
-            size_mult  = float(live.get('size_multiplier', SIZE_MULTIPLIER))
-            spread_buf = float(live.get('spread_buffer', 0.05))
-            max_age    = int(live.get('max_signal_age', SIGNAL_MAX_AGE_SECONDS))
+            copy_on          = live.get('copy_enabled', True)
+            dry_run          = live.get('dry_run', True)
+            size_mult        = float(live.get('size_multiplier', SIZE_MULTIPLIER))
+            spread_buf       = float(live.get('spread_buffer', 0.05))
+            max_age          = int(live.get('max_signal_age', SIGNAL_MAX_AGE_SECONDS))
+            max_slippage_pct = float(live.get('max_slippage_pct', 20.0))
 
             if not copy_on:
                 log.info("Copy trading DISABLED via dashboard — skipping.")
@@ -377,7 +414,8 @@ def main():
             if pending:
                 log.info(f"{len(pending)} pending signal(s).")
                 for signal in pending:
-                    execute_signal(trade_client, signal, size_mult, spread_buf, dry_run)
+                    execute_signal(trade_client, signal, size_mult, spread_buf,
+                                   dry_run, max_slippage_pct)
 
         except KeyboardInterrupt:
             log.info("Stopped by user.")

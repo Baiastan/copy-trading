@@ -151,6 +151,23 @@ with left:
 
     st.divider()
 
+    # Max slippage
+    current_slip = float(status.get('max_slippage_pct', 20.0))
+    new_slip = st.number_input(
+        "Max Slippage % (OPEN only)",
+        min_value=1.0,
+        max_value=100.0,
+        value=current_slip,
+        step=1.0,
+        format="%.0f",
+        help="If live price moved more than this % from leader's price, skip the trade."
+    )
+    if abs(new_slip - current_slip) > 0.1:
+        firebase_db.reference('copy_trading/status/max_slippage_pct').set(round(new_slip, 1))
+        st.success(f"Max slippage set to {new_slip:.0f}%")
+
+    st.divider()
+
     # Max signal age
     current_age = int(status.get('max_signal_age', 5))
     new_age = st.number_input(
