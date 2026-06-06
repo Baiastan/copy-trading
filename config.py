@@ -23,5 +23,5 @@ COPY_OPTIONS = os.getenv("COPY_OPTIONS", "true").lower() == "true"
 COPY_STOCKS = os.getenv("COPY_STOCKS", "true").lower() == "true"
 
 # Timing
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
-SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "60"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "1"))
+SIGNAL_MAX_AGE_SECONDS = int(os.getenv("SIGNAL_MAX_AGE_SECONDS", "30"))
