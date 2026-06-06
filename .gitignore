@@ -12,8 +12,9 @@ __pycache__/
 dist/
 build/
 
-# Logs
+# Logs & local data
 *.log
+trades.csv
 
 # Misc
 did.bin

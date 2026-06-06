@@ -16,6 +16,8 @@ HOW TO RUN:
   python follower_bot.py
 """
 
+import csv
+import os
 import time
 import uuid
 import json
@@ -26,6 +28,33 @@ from webull.trade.trade_client import TradeClient
 from config import (APP_KEY, APP_SECRET, DEFAULT_ACCOUNT_ID,
                     FIREBASE_DATABASE_URL, FIREBASE_CREDENTIALS_PATH,
                     SIZE_MULTIPLIER, POLL_INTERVAL, SIGNAL_MAX_AGE_SECONDS)
+
+TRADE_LOG = os.path.join(os.path.dirname(__file__), 'trades.csv')
+_CSV_HEADERS = ['timestamp', 'event_type', 'symbol', 'option_type',
+                'strike', 'expiry', 'side', 'qty', 'leader_price',
+                'order_type', 'status', 'dry_run']
+
+def log_trade(signal: dict, qty: int, status: str, dry_run: bool):
+    row = {
+        'timestamp':   datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'event_type':  signal.get('event_type', ''),
+        'symbol':      signal.get('ticker') or signal.get('symbol', ''),
+        'option_type': signal.get('option_type', ''),
+        'strike':      signal.get('strike_price') or signal.get('strike', ''),
+        'expiry':      signal.get('option_expire_date') or signal.get('expiry', ''),
+        'side':        signal.get('action') or signal.get('side', ''),
+        'qty':         qty,
+        'leader_price': signal.get('price', ''),
+        'order_type':  signal.get('order_type', 'MARKET'),
+        'status':      status,
+        'dry_run':     dry_run,
+    }
+    write_header = not os.path.exists(TRADE_LOG)
+    with open(TRADE_LOG, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_HEADERS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 DRY_RUN = True   # Set to False to place real orders
@@ -206,6 +235,7 @@ def handle_open(trade_client: TradeClient, signal: dict, size_mult: float,
     if dry_run:
         log.info(f"[DRY RUN] MARKET BUY {qty} {symbol}")
         mark_processed(key, 'ok (dry run)')
+        log_trade(signal, qty, 'ok (dry run)', dry_run)
         return
 
     try:
@@ -217,9 +247,11 @@ def handle_open(trade_client: TradeClient, signal: dict, size_mult: float,
         res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
         log.info(f"OPEN placed: {res.json()}")
         mark_processed(key, 'ok')
+        log_trade(signal, qty, 'ok', dry_run)
     except Exception as e:
         log.error(f"OPEN failed: {e}")
         mark_processed(key, f'error: {e}')
+        log_trade(signal, qty, f'error: {e}', dry_run)
 
 
 def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, dry_run: bool):
@@ -245,6 +277,7 @@ def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, dry_
     if dry_run:
         log.info(f"[DRY RUN] MARKET SELL {qty} {symbol}")
         mark_processed(key, 'ok (dry run)')
+        log_trade(signal, qty, 'ok (dry run)', dry_run)
         return
 
     try:
@@ -256,9 +289,11 @@ def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, dry_
         res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
         log.info(f"CLOSE placed: {res.json()}")
         mark_processed(key, 'ok')
+        log_trade(signal, qty, 'ok', dry_run)
     except Exception as e:
         log.error(f"CLOSE failed: {e}")
         mark_processed(key, f'error: {e}')
+        log_trade(signal, qty, f'error: {e}', dry_run)
 
 
 def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float, dry_run: bool):
@@ -283,6 +318,7 @@ def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float
     if dry_run:
         log.info(f"[DRY RUN] Would place: {desc}")
         mark_processed(key, 'ok (dry run)')
+        log_trade(signal, max(1, round(qty * size_mult)), 'ok (dry run)', dry_run)
         return
 
     try:
@@ -291,14 +327,15 @@ def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float
         res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
         log.info(f"Limit/stop order placed: {res.json()}")
 
-        # Track mapping for future cancellation
         order_map[leader_oid] = follower_oid
         symbol_orders.setdefault(symbol, []).append(follower_oid)
 
         mark_processed(key, 'ok')
+        log_trade(signal, max(1, round(qty * size_mult)), 'ok', dry_run)
     except Exception as e:
         log.error(f"PLACE_ORDER failed: {e}")
         mark_processed(key, f'error: {e}')
+        log_trade(signal, max(1, round(qty * size_mult)), f'error: {e}', dry_run)
 
 
 def handle_cancel_order(trade_client: TradeClient, signal: dict, dry_run: bool):

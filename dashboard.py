@@ -3,6 +3,7 @@ Copy-Trading Dashboard
 Run with:  streamlit run dashboard.py
 """
 
+import os
 import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, db
@@ -228,6 +229,20 @@ with right:
 
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+# ── Trade log ─────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Trade Log (this session)")
+
+TRADE_LOG = os.path.join(os.path.dirname(__file__), 'trades.csv')
+if os.path.exists(TRADE_LOG):
+    trades = pd.read_csv(TRADE_LOG)
+    trades = trades.iloc[::-1].reset_index(drop=True)  # newest first
+    st.dataframe(trades, use_container_width=True, hide_index=True)
+    st.caption(f"{len(trades)} total rows — {TRADE_LOG}")
+else:
+    st.info("No trades logged yet. trades.csv will be created when the first signal is processed.")
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
