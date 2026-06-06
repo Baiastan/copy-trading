@@ -160,79 +160,73 @@ def build_option_order(signal: dict, follower_order_id: str,
 
 # ── Signal handlers ───────────────────────────────────────────────────────────
 
-def handle_open(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
-    """Open a new position — market BUY."""
+def handle_open(trade_client: TradeClient, signal: dict, size_mult: float, dry_run: bool):
+    """Open a new position — MARKET BUY (safe on 0DTE with tight spreads)."""
     key    = signal['_key']
-    symbol = signal.get('ticker', '')
+    symbol = signal.get('ticker', '') or signal.get('symbol', '')
     qty    = max(1, round(int(signal.get('qty', 1)) * size_mult))
-    price  = float(signal.get('price', 0))
-    adj_price = round(price + spread_buf, 2)
 
-    log.info(f"OPEN  {symbol}  qty={qty}  ref_price=${adj_price}")
+    log.info(f"OPEN  {symbol}  qty={qty}  MARKET")
 
-    if DRY_RUN:
-        log.info(f"[DRY RUN] BUY {qty} {symbol} @ ~${adj_price}")
+    if dry_run:
+        log.info(f"[DRY RUN] MARKET BUY {qty} {symbol}")
         mark_processed(key, 'ok (dry run)')
         return
 
     try:
         follower_oid = new_order_id()
         new_orders = [build_option_order(
-            {**signal, 'order_type': 'LIMIT', 'side': 'BUY',
-             'limit_price': adj_price, 'time_in_force': 'DAY'},
-            follower_oid, qty, 1.0, 0.0  # qty/spread already applied above
+            {**signal, 'order_type': 'MARKET', 'side': 'BUY', 'time_in_force': 'DAY'},
+            follower_oid, qty, 1.0, 0.0
         )]
         res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
-        log.info(f"OPEN order placed: {res.json()}")
+        log.info(f"OPEN placed: {res.json()}")
         mark_processed(key, 'ok')
     except Exception as e:
-        log.error(f"OPEN order failed: {e}")
+        log.error(f"OPEN failed: {e}")
         mark_processed(key, f'error: {e}')
 
 
-def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
-    """Close a position — cancel all open stop/TP orders first, then market SELL."""
+def handle_close(trade_client: TradeClient, signal: dict, size_mult: float, dry_run: bool):
+    """Close a position — cancel open stop/TP orders first, then MARKET SELL."""
     key    = signal['_key']
-    symbol = signal.get('ticker', '')
+    symbol = signal.get('ticker', '') or signal.get('symbol', '')
     qty    = max(1, round(int(signal.get('qty', 1)) * size_mult))
-    price  = float(signal.get('price', 0))
-    adj_price = round(price - spread_buf, 2)
 
-    log.info(f"CLOSE {symbol}  qty={qty}  ref_price=${adj_price}")
+    log.info(f"CLOSE {symbol}  qty={qty}  MARKET")
 
-    # Cancel any outstanding stop/TP orders for this symbol
+    # Cancel any outstanding stop/TP orders for this symbol first
     to_cancel = symbol_orders.pop(symbol, [])
     for foid in to_cancel:
-        if DRY_RUN:
+        if dry_run:
             log.info(f"[DRY RUN] Would cancel order {foid} for {symbol}")
         else:
             try:
                 trade_client.order_v2.cancel_option(DEFAULT_ACCOUNT_ID, foid)
                 log.info(f"Cancelled order {foid}")
             except Exception as e:
-                log.warning(f"Cancel order {foid} failed (may have already filled): {e}")
+                log.warning(f"Cancel {foid} failed (may have already filled): {e}")
 
-    if DRY_RUN:
-        log.info(f"[DRY RUN] SELL {qty} {symbol} @ ~${adj_price}")
+    if dry_run:
+        log.info(f"[DRY RUN] MARKET SELL {qty} {symbol}")
         mark_processed(key, 'ok (dry run)')
         return
 
     try:
         follower_oid = new_order_id()
         new_orders = [build_option_order(
-            {**signal, 'order_type': 'LIMIT', 'side': 'SELL',
-             'limit_price': adj_price, 'time_in_force': 'DAY'},
+            {**signal, 'order_type': 'MARKET', 'side': 'SELL', 'time_in_force': 'DAY'},
             follower_oid, qty, 1.0, 0.0
         )]
         res = trade_client.order_v2.place_option(DEFAULT_ACCOUNT_ID, new_orders)
-        log.info(f"CLOSE order placed: {res.json()}")
+        log.info(f"CLOSE placed: {res.json()}")
         mark_processed(key, 'ok')
     except Exception as e:
-        log.error(f"CLOSE order failed: {e}")
+        log.error(f"CLOSE failed: {e}")
         mark_processed(key, f'error: {e}')
 
 
-def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float, dry_run: bool):
     """Mirror a stop loss or take profit order from the leader."""
     key              = signal['_key']
     leader_oid       = signal.get('leader_client_order_id', '')
@@ -251,7 +245,7 @@ def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float
 
     log.info(f"PLACE_ORDER  {desc}  qty={qty}")
 
-    if DRY_RUN:
+    if dry_run:
         log.info(f"[DRY RUN] Would place: {desc}")
         mark_processed(key, 'ok (dry run)')
         return
@@ -272,7 +266,7 @@ def handle_place_order(trade_client: TradeClient, signal: dict, size_mult: float
         mark_processed(key, f'error: {e}')
 
 
-def handle_cancel_order(trade_client: TradeClient, signal: dict):
+def handle_cancel_order(trade_client: TradeClient, signal: dict, dry_run: bool):
     """Cancel the follower's matching order when leader cancels theirs."""
     key        = signal['_key']
     leader_oid = signal.get('leader_client_order_id', '')
@@ -290,7 +284,7 @@ def handle_cancel_order(trade_client: TradeClient, signal: dict):
         if follower_oid in orders:
             orders.remove(follower_oid)
 
-    if DRY_RUN:
+    if dry_run:
         log.info(f"[DRY RUN] Would cancel {follower_oid}")
         mark_processed(key, 'ok (dry run)')
         return
@@ -304,16 +298,16 @@ def handle_cancel_order(trade_client: TradeClient, signal: dict):
         mark_processed(key, f'error: {e}')
 
 
-def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float):
+def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, spread_buf: float, dry_run: bool):
     event_type = signal.get('event_type', '')
     if event_type == 'OPEN':
-        handle_open(trade_client, signal, size_mult, spread_buf)
+        handle_open(trade_client, signal, size_mult, dry_run)
     elif event_type == 'CLOSE':
-        handle_close(trade_client, signal, size_mult, spread_buf)
+        handle_close(trade_client, signal, size_mult, dry_run)
     elif event_type == 'PLACE_ORDER':
-        handle_place_order(trade_client, signal, size_mult, spread_buf)
+        handle_place_order(trade_client, signal, size_mult, spread_buf, dry_run)
     elif event_type == 'CANCEL_ORDER':
-        handle_cancel_order(trade_client, signal)
+        handle_cancel_order(trade_client, signal, dry_run)
     else:
         log.warning(f"Unknown event_type: {event_type}")
         mark_processed(signal['_key'], f'skipped: unknown event_type {event_type}')
@@ -323,7 +317,7 @@ def execute_signal(trade_client: TradeClient, signal: dict, size_mult: float, sp
 
 def main():
     print("=" * 55)
-    print(f"Follower Bot — {'DRY RUN (no real orders)' if DRY_RUN else 'LIVE MODE'}")
+    print("Follower Bot — mode controlled by dashboard (starts in DRY RUN)")
     print("=" * 55)
     print()
 
@@ -369,7 +363,7 @@ def main():
             from firebase_admin import db as fdb
             live       = fdb.reference('copy_trading/status').get() or {}
             copy_on    = live.get('copy_enabled', True)
-            DRY_RUN    = live.get('dry_run', True)   # controlled by dashboard
+            dry_run    = live.get('dry_run', True)   # controlled by dashboard
             size_mult  = float(live.get('size_multiplier', SIZE_MULTIPLIER))
             spread_buf = float(live.get('spread_buffer', 0.05))
             max_age    = int(live.get('max_signal_age', SIGNAL_MAX_AGE_SECONDS))
@@ -383,7 +377,7 @@ def main():
             if pending:
                 log.info(f"{len(pending)} pending signal(s).")
                 for signal in pending:
-                    execute_signal(trade_client, signal, size_mult, spread_buf)
+                    execute_signal(trade_client, signal, size_mult, spread_buf, dry_run)
 
         except KeyboardInterrupt:
             log.info("Stopped by user.")
